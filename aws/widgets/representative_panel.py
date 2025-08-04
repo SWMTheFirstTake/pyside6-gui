@@ -19,6 +19,7 @@ import os
 from .pass_reason_dialog import PassReasonDialog
 from .curation_confirm_dialog import CurationConfirmDialog
 from .image_widgets import PlaceholderImageWidget, RepresentativeImageWidget
+from aws_manager import AWSManager
 
 # CurationWorker import 추가
 from .main_image_viewer import CurationWorker
@@ -37,7 +38,7 @@ class RepresentativePanel(QWidget):
     
     def __init__(self):
         super().__init__()
-        self.aws_manager = None
+        self.aws_manager:'AWSManager' = None
         self.image_cache = None
         self.main_image_viewer = None  # MainImageViewer 참조 추가
         self.current_product = None
@@ -304,9 +305,9 @@ class RepresentativePanel(QWidget):
         
         parent_layout.addWidget(controls_frame)
     
-    def set_aws_manager(self, aws_manager):
+    def set_aws_manager(self, aws_manager:AWSManager):
         """AWS 매니저 설정"""
-        self.aws_manager = aws_manager
+        self.aws_manager:AWSManager = aws_manager
     
     def set_image_cache(self, image_cache):
         """이미지 캐시 설정"""
@@ -631,7 +632,7 @@ class RepresentativePanel(QWidget):
             
         except Exception as e:
             logger.error(f"큐레이션 완료 성공 상태 표시 오류: {str(e)}")
-    
+    # CHECK : 중요 함수(상품 PASS시에 보류 처리)
     def pass_product(self):
         """상품을 보류(Pass) 상태로 처리"""
         if not self.current_product:
@@ -925,11 +926,19 @@ class RepresentativePanel(QWidget):
                 # 3단계: DynamoDB에 큐레이션 결과 저장
                 logger.info("DynamoDB 큐레이션 결과 저장 시작")
                 
+                # 제외할 text 파일명 수집
+                excluded_text_filenames = []
+                if self.main_image_viewer:
+                    excluded_text_filenames = self.main_image_viewer.get_excluded_text_filenames()
+                    if excluded_text_filenames:
+                        logger.info(f"DynamoDB에서 제외할 text 파일: {excluded_text_filenames}")
+                
                 success = self.aws_manager.update_curation_result(
                     sub_category=sub_category,
                     product_id=product_id,
                     representative_images=self.representative_images,
-                    color_variant_images=self.color_variant_images
+                    color_variant_images=self.color_variant_images,
+                    excluded_text_filenames=excluded_text_filenames
                 )
                 
                 if not success:

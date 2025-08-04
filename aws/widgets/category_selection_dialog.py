@@ -14,6 +14,8 @@ from PySide6.QtGui import QFont
 from aws_manager import AWSManager
 from dataclasses import dataclass , field
 from typing import Annotated
+import logging
+logger = logging.getLogger(__name__)
 @dataclass
 class CategoryStats:
     total: int
@@ -245,7 +247,7 @@ class CategorySelectionDialog(QDialog):
                 result.total_products += category_stats.total
                 
             except (ValueError, IndexError) as e:
-                print(f"카테고리 키 파싱 오류: {category_key} - {e}")
+                logger.error(f"카테고리 키 파싱 오류: {category_key} - {e}")
                 continue
         
         return result
@@ -381,7 +383,7 @@ class CategorySelectionDialog(QDialog):
             
         except Exception as e:
             self.stats_label.setText(f"통계 정보 로드 오류: {str(e)}")
-            print(f"통계 정보 업데이트 오류: {e}")
+            logger.error(f"통계 정보 업데이트 오류: {e}")
     
     
     def check_selection_complete(self):

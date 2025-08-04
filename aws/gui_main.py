@@ -27,7 +27,8 @@ from widgets.product_list_widget import ProductListWidget
 from widgets.category_selection_dialog import CategorySelectionDialog
 
 from typing import Annotated
-
+import logging
+logging.basicConfig(level=logging.INFO , format='%(asctime)s - %(name)s - %(levelname)s - %(message)s - %(filename)s - %(lineno)d')
 
 logger = logging.getLogger(__name__)
 
@@ -782,5 +783,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+    
 
 

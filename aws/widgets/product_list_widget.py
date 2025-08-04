@@ -13,6 +13,7 @@ from PySide6.QtGui import QFont, QPalette
 from typing import Optional, Dict, Any, List
 import logging
 
+from aws_manager import AWSManager
 logger = logging.getLogger(__name__)
 
 
@@ -27,7 +28,7 @@ class ProductLoadThread(QThread):
     def __init__(self, aws_manager, sub_category: int = None, status_filter: str = None,
                  exclusive_start_key: Dict[str, Any] = None, limit: int = 20):
         super().__init__()
-        self.aws_manager = aws_manager
+        self.aws_manager:AWSManager = aws_manager
         self.sub_category = sub_category
         self.status_filter = status_filter
         self.exclusive_start_key = exclusive_start_key
@@ -389,7 +390,7 @@ class ProductListWidget(QWidget):
         """상태 필터 설정"""
         try:
             # 유효한 상태인지 확인
-            valid_statuses = ["ALL", "PENDING", "IN_PROGRESS", "COMPLETED", "PASS"]
+            valid_statuses = ["ALL", "PENDING", "COMPLETED", "PASS"]
             if status in valid_statuses:
                 # 시그널 차단하여 on_filter_changed가 호출되지 않도록 함
                 self.status_combo.blockSignals(True)

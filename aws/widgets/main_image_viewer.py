@@ -16,6 +16,11 @@ import os
 from PIL import Image
 from pathlib import Path
 import weakref
+import sys
+import webbrowser  # 무신사 페이지 열기 위한 모듈 추가
+from typing import Dict, Any, List, Optional, Tuple
+from functools import partial
+from datetime import datetime
 
 # 이미지 뷰어 모듈 import
 from .image_viewer_dialog import UrlImageViewerDialog
@@ -177,6 +182,7 @@ class GridImageWidget(QWidget):
         self.image_data = image_data
         self.image_cache = image_cache
         self.is_selected = False
+        self.is_excluded_from_dynamodb = False  # DynamoDB 제외 상태 추가
         self._is_destroyed = False  # 위젯 파괴 상태 추적
         self._signals_connected = False  # 시그널 연결 상태 추적
         self._connected_signals_and_slots = []  # (시그널, 슬롯) 튜플 저장
@@ -402,7 +408,41 @@ class GridImageWidget(QWidget):
             if not hasattr(self.image_frame, 'setStyleSheet'):
                 return
             
-            if self.is_selected:
+            # DynamoDB 제외 상태가 최우선 (빨간색 테두리 + 반투명 오버레이)
+            if self.is_excluded_from_dynamodb:
+                self.image_frame.setStyleSheet("""
+                    QFrame {
+                        border: 4px solid #dc3545;
+                        border-radius: 4px;
+                        background-color: rgba(220, 53, 69, 0.1);
+                        position: relative;
+                    }
+                    QFrame:hover {
+                        background-color: rgba(220, 53, 69, 0.2);
+                    }
+                """)
+                
+                # 제외 상태 오버레이 추가
+                if not hasattr(self, 'exclude_overlay'):
+                    self.exclude_overlay = QLabel("DynamoDB\n제외됨", self.image_frame)
+                    self.exclude_overlay.setAlignment(Qt.AlignCenter)
+                    self.exclude_overlay.setStyleSheet("""
+                        QLabel {
+                            background-color: rgba(220, 53, 69, 0.8);
+                            color: white;
+                            font-weight: bold;
+                            font-size: 10px;
+                            border-radius: 3px;
+                            padding: 2px;
+                        }
+                    """)
+                    self.exclude_overlay.setFixedSize(60, 30)
+                    self.exclude_overlay.move(5, 5)  # 좌상단에 위치
+                    
+                self.exclude_overlay.setVisible(True)
+                
+            # 일반 선택 상태 (파란색 테두리)
+            elif self.is_selected:
                 self.image_frame.setStyleSheet("""
                     QFrame {
                         border: 3px solid #007bff;
@@ -410,6 +450,11 @@ class GridImageWidget(QWidget):
                         background-color: #e3f2fd;
                     }
                 """)
+                # 제외 오버레이 숨기기
+                if hasattr(self, 'exclude_overlay'):
+                    self.exclude_overlay.setVisible(False)
+                    
+            # 기본 상태
             else:
                 self.image_frame.setStyleSheet("""
                     QFrame {
@@ -422,6 +467,10 @@ class GridImageWidget(QWidget):
                         background-color: #f0f8ff;
                     }
                 """)
+                # 제외 오버레이 숨기기
+                if hasattr(self, 'exclude_overlay'):
+                    self.exclude_overlay.setVisible(False)
+                    
         except RuntimeError:
             self._is_destroyed = True
         except Exception as e:
@@ -440,6 +489,20 @@ class GridImageWidget(QWidget):
             self._is_destroyed = True
         except Exception as e:
             logger.warning(f"선택 상태 설정 중 오류: {e}")
+            self._is_destroyed = True
+    
+    def set_excluded_from_dynamodb(self, excluded: bool):
+        """DynamoDB 제외 상태 설정"""
+        if self._is_destroyed:
+            return
+            
+        try:
+            self.is_excluded_from_dynamodb = excluded
+            self.update_frame_style()
+        except RuntimeError:
+            self._is_destroyed = True
+        except Exception as e:
+            logger.warning(f"제외 상태 설정 중 오류: {e}")
             self._is_destroyed = True
     
     def load_image(self):
@@ -752,6 +815,10 @@ class MainImageViewer(QWidget):
         # 이미지 이동 히스토리 관리
         self.move_history = []  # 이동 히스토리 [(image_data, from_folder, to_folder, timestamp), ...]
         self.pending_moves = []  # S3에 반영되지 않은 이동 목록 [(source_key, dest_key), ...]
+        
+        # DynamoDB 제외 기능 관리
+        self.excluded_from_dynamodb = set()  # DynamoDB에서 제외할 이미지들의 식별자 저장
+        self.exclude_mode_active = False     # 제외 모드 활성화 상태
         
         self.folder_tabs = {}
         self.curation_worker = None  # 큐레이션 워커
@@ -1251,7 +1318,7 @@ class MainImageViewer(QWidget):
     def restore_default_mode_message(self):
         """기본 모드 메시지 복원"""
         try:
-            self.current_mode_label.setText("모드를 선택하고 이미지를 클릭하세요 (1:모델, 2:정면, 3:후면, 4:색상, ESC:취소, V:뷰어, Ctrl+Z:되돌리기, Ctrl+R:복구, M:이동, Tab:탭이동)")
+            self.current_mode_label.setText("모드를 선택하고 이미지를 클릭하세요 (1:모델, 2:정면, 3:후면, 4:색상, 5:DB제외, ESC:취소, V:뷰어, Ctrl+Z:되돌리기, Ctrl+R:복구, M:이동, Tab:탭이동)")
             self.current_mode_label.setStyleSheet("color: #6c757d; font-size: 11px; background-color: transparent;")
         except Exception as e:
             logger.error(f"기본 메시지 복원 오류: {str(e)}")
@@ -1505,7 +1572,7 @@ class MainImageViewer(QWidget):
         mode_layout.setSpacing(4)
         
         # 안내 레이블
-        info_label = QLabel("대표 이미지 선택 및 이미지 관리 (단축키: 1-4, V, ESC, Ctrl+Z, Ctrl+R):")
+        info_label = QLabel("대표 이미지 선택 및 이미지 관리 (단축키: 1-5, V, ESC, Ctrl+Z, Ctrl+R):")
         info_label.setStyleSheet("font-weight: bold; font-size: 12px; color: #495057; background-color: transparent;")
         mode_layout.addWidget(info_label)
         
@@ -1518,7 +1585,8 @@ class MainImageViewer(QWidget):
             ('model_wearing', '(1) 모델', '#28a745', '#1e7e34'),
             ('front_cutout', '(2) 정면', '#007bff', '#0056b3'),
             ('back_cutout', '(3) 후면', '#6f42c1', '#5a2d91'),
-            ('color_variant', '(4) 제품 색상', '#fd7e14', '#e55100')
+            ('color_variant', '(4) 제품 색상', '#fd7e14', '#e55100'),
+            ('exclude_from_dynamodb', '(5) DB제외', '#dc3545', '#c82333')
         ]
         
         for mode_key, mode_text, color, hover_color in mode_configs:
@@ -1552,7 +1620,19 @@ class MainImageViewer(QWidget):
             def create_mode_click_handler(mode):
                 return lambda checked: self.set_selection_mode(mode)
             
-            btn.clicked.connect(create_mode_click_handler(mode_key))
+            # btn.clicked.connect(create_mode_click_handler(mode_key))
+            
+            if mode_key == 'exclude_from_dynamodb':
+                # DynamoDB 제외 버튼은 별도 처리
+                def create_exclude_click_handler():
+                    return lambda checked: self.set_exclude_mode(checked)
+                btn.clicked.connect(create_exclude_click_handler())
+            else:
+                # 기존 대표 이미지 선택 버튼들
+                def create_mode_click_handler(mode):
+                    return lambda checked: self.set_selection_mode(mode)
+                btn.clicked.connect(create_mode_click_handler(mode_key))
+            
             
             self.mode_buttons[mode_key] = btn
             buttons_layout.addWidget(btn)
@@ -1618,7 +1698,7 @@ class MainImageViewer(QWidget):
                 'model_wearing': "모델 착용 이미지를 선택하세요",
                 'front_cutout': "정면 누끼 이미지를 선택하세요", 
                 'back_cutout': "후면 누끼 이미지를 선택하세요",
-                'color_variant': "제품 색상 이미지를 선택하세요"
+                'color_variant': "제품 색상 이미지를 선택하세요",
             }
             
             self.current_mode_label.setText(mode_messages.get(mode, "이미지를 선택하세요"))
@@ -1632,18 +1712,22 @@ class MainImageViewer(QWidget):
             QTimer.singleShot(100, self.force_button_repair)
     
     def clear_selection_mode(self):
-        """선택 모드 초기화"""
+        """선택 모드 및 제외 모드 초기화"""
         try:
             logger.debug("선택 모드 초기화 시작")
             self.selection_mode = None
+            
+            # DynamoDB 제외 모드도 함께 취소
+            if self.exclude_mode_active:
+                self.set_exclude_mode(False)
             
             # 버튼 상태 안전하게 초기화
             for btn in self.mode_buttons.values():
                 if btn and btn.isCheckable():
                     btn.setChecked(False)
             
-            # 기본 메시지 복원
-            self.current_mode_label.setText("모드를 선택하고 이미지를 클릭하세요 (1:모델, 2:정면, 3:후면, 4:색상, ESC:취소, V:뷰어, Ctrl+Z:되돌리기, Ctrl+R:복구, M:이동, Tab:탭이동)")
+            # 기본 메시지 복원 (5번 키 추가)
+            self.current_mode_label.setText("모드를 선택하고 이미지를 클릭하세요 (1:모델, 2:정면, 3:후면, 4:색상, 5:DB제외, ESC:취소, V:뷰어, Ctrl+Z:되돌리기, Ctrl+R:복구, M:이동, Tab:탭이동)")
             self.current_mode_label.setStyleSheet("color: #6c757d; font-size: 11px; background-color: transparent;")
             
             logger.debug("선택 모드 초기화 완료")
@@ -1656,13 +1740,11 @@ class MainImageViewer(QWidget):
         controls_frame = QFrame()
         controls_frame.setStyleSheet("background-color: #f8f9fa; color: #212529; border-top: 1px solid #dee2e6; border-radius: 5px;")
         controls_layout = QVBoxLayout(controls_frame)
-        controls_layout.setContentsMargins(10, 5, 10, 5)
+
+        # 하단 컨트롤 영역의 여백(마진) 설정: 왼쪽 15, 위 5, 오른쪽 15, 아래 5 픽셀
+        controls_layout.setContentsMargins(15, 5, 15, 5)
+        # 하단 컨트롤 영역의 위젯(버튼 등) 사이의 세로 간격을 10픽셀로 설정합니다.
         controls_layout.setSpacing(10)
-        
-        # # 상단: 안내 메시지
-        # info_label = QLabel("💡 Segment 이미지(S3 및 로컬 생성)를 Text 폴더로 이동(M), 되돌리기(Ctrl+Z) 기능을 사용하세요")
-        # info_label.setStyleSheet("color: #6c757d; font-size: 11px; font-style: italic;")
-        # controls_layout.addWidget(info_label)
         
         # 하단: 버튼들
         buttons_layout = QHBoxLayout()
@@ -1678,10 +1760,10 @@ class MainImageViewer(QWidget):
                 background-color: #fd7e14;
                 color: white;
                 border: none;
-                padding: 4px 8px;
+                padding: 4px 4px;
                 border-radius: 3px;
                 font-weight: bold;
-                font-size: 10px;
+                font-size: 12px;
             }
             QPushButton:hover {
                 background-color: #e55100;
@@ -1703,10 +1785,10 @@ class MainImageViewer(QWidget):
                 background-color: #6c757d;
                 color: white;
                 border: none;
-                padding: 4px 8px;
+                padding: 4px 4px;
                 border-radius: 3px;
                 font-weight: bold;
-                font-size: 10px;
+                font-size: 12px;
             }
             QPushButton:hover {
                 background-color: #5a6268;
@@ -1729,16 +1811,36 @@ class MainImageViewer(QWidget):
                 background-color: #28a745;
                 color: white;
                 border: none;
-                padding: 4px 8px;
+                padding: 4px 4px;
                 border-radius: 3px;
                 font-weight: bold;
-                font-size: 10px;
+                font-size: 12px;
             }
             QPushButton:hover {
                 background-color: #218838;
             }
         """)
         buttons_layout.addWidget(viewer_btn)
+        
+        # 무신사 상품 페이지 버튼 (맨 우측)
+        musinsa_btn = QPushButton("🛍️ 무신사 상품 페이지")
+        musinsa_btn.setToolTip("현재 상품의 무신사 웹페이지 열기")
+        musinsa_btn.clicked.connect(self.open_musinsa_page)
+        musinsa_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #6f42c1;
+                color: white;
+                border: none;
+                padding: 4px 4px;
+                border-radius: 3px;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #5a2d91;
+            }
+        """)
+        buttons_layout.addWidget(musinsa_btn)
         
         controls_layout.addLayout(buttons_layout)
         parent_layout.addWidget(controls_frame)
@@ -1769,6 +1871,9 @@ class MainImageViewer(QWidget):
         """
         self.current_images = images
         self.current_product = product_data
+        
+        # DynamoDB 제외 목록 초기화 (새 상품 로드 시)
+        self.clear_excluded_images()
         
         # 도움말 버튼 활성화 (제품이 로드되면) => meta.json 정보 확인가능한 버튼 
         self.help_button.setEnabled(True)
@@ -1865,6 +1970,12 @@ class MainImageViewer(QWidget):
                     try:
                         # 그리드 이미지 위젯 생성
                         image_widget = GridImageWidget(image_data, self.image_cache)
+                        
+                        # DynamoDB 제외 상태 설정 (text 폴더인 경우만)
+                        if folder_name == 'text':
+                            image_identifier = self.get_image_identifier(image_data)
+                            is_excluded = image_identifier in self.excluded_from_dynamodb
+                            image_widget.set_excluded_from_dynamodb(is_excluded)
                         
                         # 시그널 연결 - partial 함수 객체를 명시적으로 저장
                         try:
@@ -2018,6 +2129,11 @@ class MainImageViewer(QWidget):
         
         # 버튼 상태 업데이트
         self.update_button_states(folder_name, image_data)
+        
+        # DynamoDB 제외 모드가 활성화되어 있으면 제외 토글 실행
+        if self.exclude_mode_active:
+            self.toggle_image_exclusion(image_data)
+            return
         
         # 선택된 모드가 있으면 바로 대표 이미지로 설정
         if self.selection_mode:
@@ -2536,6 +2652,15 @@ class MainImageViewer(QWidget):
                 self.set_selection_mode('color_variant')
                 event.accept()
                 return
+            elif event.key() == Qt.Key_5:
+                logger.debug("키보드 5번 눌림 - DynamoDB 제외 모드")
+                current_folder = self.get_current_folder_name()
+                if current_folder == 'text':
+                    self.set_exclude_mode(not self.exclude_mode_active)
+                else:
+                    self.show_status_message("❌ text 폴더에서만 DynamoDB 제외 모드를 사용할 수 있습니다", error=True)
+                event.accept()
+                return
             
             # ESC: 선택 모드 취소
             elif event.key() == Qt.Key_Escape:
@@ -2624,3 +2749,150 @@ class MainImageViewer(QWidget):
             
         except Exception as e:
             logger.error(f"강제 버튼 복구 오류: {str(e)}")
+    
+    # =============================================================================
+    # DynamoDB 제외 기능 관련 메서드들
+    # =============================================================================
+    
+    def get_image_identifier(self, image_data: dict) -> str:
+        """이미지의 고유 식별자를 생성"""
+        product_id = self.current_product.get('product_id', 'unknown') if self.current_product else 'unknown'
+        folder = image_data.get('folder', 'unknown')
+        filename = image_data.get('filename', 'unknown')
+        return f"{product_id}:{folder}:{filename}"
+    
+    def is_image_in_text_folder(self, image_data: dict) -> bool:
+        """이미지가 text 폴더에 있는지 확인"""
+        return image_data.get('folder') == 'text'
+    
+    def get_current_folder_name(self) -> str:
+        """현재 선택된 탭의 폴더명을 반환"""
+        if hasattr(self, 'tab_widget') and self.tab_widget:
+            current_index = self.tab_widget.currentIndex()
+            folder_names = list(self.folder_tabs.keys())
+            if 0 <= current_index < len(folder_names):
+                return folder_names[current_index]
+        return 'unknown'
+    
+    def toggle_image_exclusion(self, image_data: dict):
+        """이미지의 DynamoDB 제외 상태 토글 (text 폴더만)"""
+        if not self.is_image_in_text_folder(image_data):
+            self.show_status_message("❌ text 폴더의 이미지만 제외할 수 있습니다", error=True)
+            return
+        
+        image_key = self.get_image_identifier(image_data)
+        if image_key in self.excluded_from_dynamodb:
+            self.excluded_from_dynamodb.remove(image_key)
+            logger.info(f"DynamoDB 제외 해제: {image_data.get('filename')}")
+            self.show_status_message(f"✅ DynamoDB 제외 해제: {image_data.get('filename')}")
+        else:
+            self.excluded_from_dynamodb.add(image_key)
+            logger.info(f"DynamoDB 제외 추가: {image_data.get('filename')}")
+            self.show_status_message(f"🚫 DynamoDB 제외 추가: {image_data.get('filename')}")
+        
+        # 즉시 시각적 업데이트 - text 탭의 모든 이미지 위젯 업데이트
+        if 'text' in self.folder_tabs:
+            text_tab_data = self.folder_tabs['text']
+            for widget in text_tab_data.get('image_widgets', []):
+                if hasattr(widget, 'set_excluded_from_dynamodb') and hasattr(widget, 'image_data'):
+                    widget_image_key = self.get_image_identifier(widget.image_data)
+                    is_excluded = widget_image_key in self.excluded_from_dynamodb
+                    widget.set_excluded_from_dynamodb(is_excluded)
+        
+        # 시각적 업데이트
+        self.update_exclude_status_display()
+    
+    def update_exclude_status_display(self):
+        """제외 상태 표시 업데이트"""
+        excluded_count = len(self.excluded_from_dynamodb)
+        if excluded_count > 0:
+            status_text = f"DynamoDB 제외 모드: {excluded_count}개 파일 제외됨"
+            if hasattr(self, 'current_mode_label'):
+                self.current_mode_label.setText(status_text)
+                self.current_mode_label.setStyleSheet("color: #dc3545; font-size: 11px; background-color: transparent; font-weight: bold;")
+        else:
+            if hasattr(self, 'current_mode_label') and not self.exclude_mode_active:
+                self.restore_default_mode_message()
+    
+    def set_exclude_mode(self, active: bool):
+        """DynamoDB 제외 모드 설정/해제"""
+        current_folder = self.get_current_folder_name()
+        if active and current_folder != 'text':
+            self.show_status_message("❌ text 폴더에서만 DynamoDB 제외 모드를 사용할 수 있습니다", error=True)
+            return
+        
+        self.exclude_mode_active = active
+        
+        if active:
+            # 제외 모드 활성화
+            if hasattr(self, 'current_mode_label'):
+                self.current_mode_label.setText("DynamoDB 제외 모드: 이미지를 클릭하여 DynamoDB 업데이트에서 제외하세요")
+                self.current_mode_label.setStyleSheet("color: #dc3545; font-size: 11px; background-color: transparent; font-weight: bold;")
+            
+            # 모든 기존 모드 버튼 해제
+            for btn in self.mode_buttons.values():
+                if btn and btn.isCheckable():
+                    btn.setChecked(False)
+            
+            # 제외 모드 버튼 활성화 (있다면)
+            if 'exclude_from_dynamodb' in self.mode_buttons:
+                exclude_btn = self.mode_buttons['exclude_from_dynamodb']
+                if exclude_btn and exclude_btn.isCheckable():
+                    exclude_btn.setChecked(True)
+            
+            logger.info("DynamoDB 제외 모드 활성화")
+        else:
+            # 제외 모드 비활성화
+            self.restore_default_mode_message()
+            
+            # 제외 모드 버튼 비활성화 (있다면)
+            if 'exclude_from_dynamodb' in self.mode_buttons:
+                exclude_btn = self.mode_buttons['exclude_from_dynamodb']
+                if exclude_btn and exclude_btn.isCheckable():
+                    exclude_btn.setChecked(False)
+            
+            logger.info("DynamoDB 제외 모드 비활성화")
+    
+    def clear_excluded_images(self):
+        """제외된 이미지 목록 초기화 (새 상품 로드 시)"""
+        self.excluded_from_dynamodb.clear()
+        self.exclude_mode_active = False
+        
+        # 모든 이미지 위젯의 제외 상태 초기화
+        for folder_name, tab_data in self.folder_tabs.items():
+            for widget in tab_data.get('image_widgets', []):
+                if hasattr(widget, 'set_excluded_from_dynamodb'):
+                    widget.set_excluded_from_dynamodb(False)
+        
+        logger.info("DynamoDB 제외 목록 초기화")
+    
+    def get_excluded_text_filenames(self) -> list[str]:
+        """text 폴더에서 DynamoDB 업데이트에서 제외할 파일명들을 반환"""
+        excluded_filenames = []
+        
+        for image_identifier in self.excluded_from_dynamodb:
+            # image_identifier 형식: "product_id:folder:filename"
+            if ':text:' in image_identifier:  # text 폴더인 경우만
+                filename = image_identifier.split(':')[-1]  # 마지막 부분이 파일명
+                excluded_filenames.append(filename)
+        
+        return excluded_filenames
+
+    def open_musinsa_page(self):
+        """현재 상품의 무신사 웹페이지 열기"""
+        if not self.current_product:
+            self.show_status_message("❌ 상품 정보가 없습니다", error=True)
+            return
+            
+        product_id = self.current_product.get('product_id')
+        if not product_id:
+            self.show_status_message("❌ 상품 ID를 찾을 수 없습니다", error=True)
+            return
+            
+        url = f"https://www.musinsa.com/products/{product_id}"
+        try:
+            webbrowser.open(url)
+            self.show_status_message(f"✅ 무신사 상품 페이지 열기: {product_id}")
+        except Exception as e:
+            logger.error(f"무신사 페이지 열기 오류: {str(e)}")
+            self.show_status_message("❌ 무신사 페이지 열기 실패", error=True)

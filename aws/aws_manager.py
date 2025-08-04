@@ -15,7 +15,6 @@ import mimetypes
 import logging
 import botocore.config
 # 로깅 설정
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -520,6 +519,7 @@ class AWSManager:
     def update_curation_result(self, sub_category: int, product_id: str, 
                             representative_images: dict[str, Any],
                             color_variant_images: dict[str, Any],
+                            excluded_text_filenames: list[str] = None,
                           completed_by: str|None = None) -> bool:
         """
         DynamoDB에 큐레이션 결과를 업데이트합니다.
@@ -529,6 +529,7 @@ class AWSManager:
             product_id: 제품 ID
             representative_images: 대표 이미지 딕셔너리 (model_wearing, front_cutout, back_cutout)
             color_variant_images: 색상 변형 이미지 딕셔너리
+            excluded_text_filenames: text 필드에서 제외할 파일명 리스트
             completed_by: 작업자 ID
             
         Returns:
@@ -540,10 +541,7 @@ class AWSManager:
             existing_product = self.get_product_detail(sub_category, product_id)
             if not existing_product:
                 logger.error(f"제품을 찾을 수 없습니다: {sub_category}-{product_id}")
-                return False
-            
-            current_time = self._get_current_timestamp()
-            
+                return False            
             # SET 표현식 (새로운 값 설정)
             set_expression_parts = ["curation_status = :status" , "sub_category_curation_status = :sub_category_curation_status"]
             expression_values = {
@@ -603,6 +601,7 @@ class AWSManager:
             
             # REMOVE 표현식 (불필요한 필드 제거)
             remove_expression_parts = []
+            expression_attribute_names = {}
             
             # PASS 상태에서 COMPLETED로 변경하는 경우 pass_reason 필드 제거
             if existing_product.get('curation_status') == 'PASS':
@@ -614,23 +613,64 @@ class AWSManager:
                 # representative_assets와 completed_by는 새로 설정하므로 제거하지 않음
                 pass
             
+            # text 필드에서 제외할 파일들 처리
+            if excluded_text_filenames:
+                text_field = existing_product.get('text', [])
+                if text_field:
+                    # 제거할 파일들의 인덱스 찾기
+                    indices_to_remove = []
+                    for i, filename in enumerate(text_field):
+                        if filename in excluded_text_filenames:
+                            indices_to_remove.append(i)
+                    
+                    # 역순으로 정렬하여 뒤부터 제거 (인덱스 충돌 방지)
+                    indices_to_remove.sort(reverse=True)
+                    
+                    if indices_to_remove:
+                        # ExpressionAttributeNames에 text 필드 추가
+                        expression_attribute_names['#text_field'] = 'text'
+                        
+                        # REMOVE 표현식에 text 인덱스들 추가
+                        text_remove_parts = [f"#text_field[{idx}]" for idx in indices_to_remove]
+                        remove_expression_parts.extend(text_remove_parts)
+                        
+                        logger.info(f"text 필드에서 제거할 인덱스: {indices_to_remove}")
+                        logger.info(f"제거할 파일명: {[text_field[i] for i in indices_to_remove]}")
+                    else:
+                        logger.info(f"text 필드에서 제거할 파일을 찾을 수 없습니다: {excluded_text_filenames}")
+                else:
+                    logger.warning(f"text 필드가 비어있습니다: {sub_category}-{product_id}")
+
+            # 작업 업데이트 시간 추가
+            current_time = self._get_current_timestamp()
+            set_expression_parts.append("caption_updated_at = :caption_updated_at")
+            expression_values[':caption_updated_at'] = {'S': current_time}
+            
             # 업데이트 표현식 구성
             update_expression = f"SET {', '.join(set_expression_parts)}"
+
             
             # REMOVE 표현식이 있는 경우 추가
             if remove_expression_parts:
                 update_expression += f" REMOVE {', '.join(remove_expression_parts)}"
             
+            
             # 제품 상태 업데이트
-            self.dynamodb_client.update_item(
-                TableName=self.table_name,
-                Key={
+            update_params = {
+                'TableName': self.table_name,
+                'Key': {
                     'sub_category': {'N': str(sub_category)},
                     'product_id': {'S': product_id}
                 },
-                UpdateExpression=update_expression,
-                ExpressionAttributeValues=expression_values
-            )
+                'UpdateExpression': update_expression,
+                'ExpressionAttributeValues': expression_values
+            }
+            
+            # ExpressionAttributeNames가 있는 경우 추가
+            if expression_attribute_names:
+                update_params['ExpressionAttributeNames'] = expression_attribute_names
+            
+            self.dynamodb_client.update_item(**update_params)
             
             logger.info(f"DynamoDB 큐레이션 결과 업데이트 성공: {sub_category}-{product_id}")
             if remove_expression_parts:
@@ -663,9 +703,10 @@ class AWSManager:
             
             
             # SET 표현식 (새로운 값 설정)
-            set_expression_parts = ["curation_status = :status"]
+            set_expression_parts = ["curation_status = :status" , "sub_category_curation_status = :sub_category_curation_status"]
             expression_values = {
                 ':status': {'S': 'PASS'},
+                ':sub_category_curation_status': {'S': f"{sub_category}#PASS"}
             }
             
             # pass_reason이 제공된 경우 추가
@@ -686,7 +727,11 @@ class AWSManager:
                 if 'representative_assets' in existing_product:
                     remove_expression_parts.append("representative_assets")
                 # completed_by는 PASS 처리에서도 사용하므로 제거하지 않음
-            
+            # 작업 업데이트 시간 추가
+            current_time = self._get_current_timestamp()
+            set_expression_parts.append("caption_updated_at = :caption_updated_at")
+            expression_values[':caption_updated_at'] = {'S': current_time}
+
             # 업데이트 표현식 구성
             update_expression = f"SET {', '.join(set_expression_parts)}"
             

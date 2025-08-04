@@ -8,7 +8,8 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from typing import Optional
-
+import logging
+logger = logging.getLogger(__name__)
 
 class CurationConfirmDialog(QDialog):
     """큐레이션 완료 확인 다이얼로그 (키보드 단축키 지원)"""
